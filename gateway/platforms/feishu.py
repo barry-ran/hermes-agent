@@ -1342,6 +1342,11 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        # observe 模式：Agent 选择静默时直接跳过，不向群聊发送任何内容
+        if content.strip() == "[SILENT]":
+            logger.debug("[Feishu] Observe mode: Agent chose SILENT, suppressing reply to chat %s", chat_id)
+            return SendResult(success=True)
+
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
@@ -2142,6 +2147,26 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if inbound_type == MessageType.TEXT and text.startswith("/"):
             inbound_type = MessageType.COMMAND
+
+        # observe 模式：若群消息未 @Bot，注入 SILENT 指令，让 Agent 自行判断是否回复
+        if chat_type != "p2p" and inbound_type == MessageType.TEXT:
+            chat_id_tmp = getattr(message, "chat_id", "") or ""
+            rule_tmp = self._group_rules.get(chat_id_tmp) if chat_id_tmp else None
+            policy_tmp = (rule_tmp.policy if rule_tmp else None) or self._default_group_policy or self._group_policy
+            if policy_tmp == "observe":
+                mentions = getattr(message, "mentions", None) or []
+                is_mentioned = bool(mentions and self._message_mentions_bot(mentions))
+                if not is_mentioned:
+                    raw_content = getattr(message, "content", "") or ""
+                    if "@_all" in raw_content:
+                        is_mentioned = True
+                if not is_mentioned:
+                    text = (
+                        f"[群聊旁听]\n{text}\n\n"
+                        "（你正在旁听群聊消息，该消息没有直接 @你。"
+                        "如果此消息与你的职责无关或不需要你参与，请只回复 [SILENT]，不要输出其他内容。"
+                        "只有当消息明确需要你的专业能力时，才正常回复。）"
+                    )
 
         reply_to_message_id = (
             getattr(message, "parent_id", None)
@@ -3015,6 +3040,9 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
         if policy == "open":
             return True
+        if policy == "observe":
+            # observe 模式：接受所有群消息，让 Agent 决定是否回复
+            return True
         if policy == "admin_only":
             return False
         if policy == "allowlist":
@@ -3025,9 +3053,20 @@ class FeishuAdapter(BasePlatformAdapter):
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
-        """Require an explicit @mention before group messages enter the agent."""
+        """Require an explicit @mention before group messages enter the agent.
+        
+        In ``observe`` policy mode, all group messages are accepted without requiring
+        an @mention. The agent is expected to reply ``[SILENT]`` for irrelevant messages.
+        """
         if not self._allow_group_message(sender_id, chat_id):
             return False
+
+        # observe 模式：跳过 @mention 门槛，所有群消息都进入 Agent
+        rule = self._group_rules.get(chat_id) if chat_id else None
+        policy = (rule.policy if rule else None) or self._default_group_policy or self._group_policy
+        if policy == "observe":
+            return True
+
         # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
