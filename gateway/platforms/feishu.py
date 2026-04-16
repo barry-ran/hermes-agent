@@ -993,6 +993,63 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     if original_configure is not None:
         setattr(ws_client, "_configure", _configure_with_overrides)
     _apply_runtime_ws_overrides()
+
+    # --- Patch _handle_data_frame to route MessageType.CARD through the event handler.
+    # lark_oapi 1.5.3 drops CARD-type frames with a bare `return`, so card.action.trigger
+    # callbacks sent via WebSocket are silently discarded.  We replace the method with a
+    # version that treats CARD frames identically to EVENT frames. ---
+    _original_handle_data_frame = ws_client_module.Client._handle_data_frame
+
+    async def _patched_handle_data_frame(self_ws: Any, frame: Any) -> None:
+        try:
+            from lark_oapi.ws.enum import MessageType as _MT
+            from lark_oapi.ws.const import (
+                HEADER_TYPE, HEADER_MESSAGE_ID, HEADER_TRACE_ID,
+                HEADER_SUM, HEADER_SEQ, HEADER_BIZ_RT,
+            )
+            from lark_oapi.core.const import UTF_8 as _UTF8
+            from lark_oapi.core.json import JSON as _JSON
+            from lark_oapi.ws.model import Response as _Response
+            import http as _http
+            import base64 as _b64
+            import time as _time
+
+            hs = frame.headers
+            type_val = ws_client_module._get_by_key(hs, HEADER_TYPE)
+            if _MT(type_val) == _MT.CARD and self_ws._event_handler is not None:
+                msg_id = ws_client_module._get_by_key(hs, HEADER_MESSAGE_ID)
+                trace_id = ws_client_module._get_by_key(hs, HEADER_TRACE_ID)
+                sum_ = ws_client_module._get_by_key(hs, HEADER_SUM)
+                seq = ws_client_module._get_by_key(hs, HEADER_SEQ)
+                pl = frame.payload
+                if int(sum_) > 1:
+                    pl = self_ws._combine(msg_id, int(sum_), int(seq), pl)
+                    if pl is None:
+                        return
+                logger.debug("[Feishu][ws-patch] routing CARD frame to event handler, trace=%s", trace_id)
+                resp = _Response(code=_http.HTTPStatus.OK)
+                try:
+                    start = int(round(_time.time() * 1000))
+                    result = self_ws._event_handler.do_without_validation(pl)
+                    end = int(round(_time.time() * 1000))
+                    h = hs.add()
+                    h.key = HEADER_BIZ_RT
+                    h.value = str(end - start)
+                    if result is not None:
+                        resp.data = _b64.b64encode(_JSON.marshal(result).encode(_UTF8))
+                except Exception as exc:
+                    logger.error("[Feishu][ws-patch] CARD event_handler raised: %s", exc)
+                    resp = _Response(code=_http.HTTPStatus.INTERNAL_SERVER_ERROR)
+                frame.payload = _JSON.marshal(resp).encode(_UTF8)
+                await self_ws._write_message(frame.SerializeToString())
+                return
+        except Exception:
+            pass
+        await _original_handle_data_frame(self_ws, frame)
+
+    ws_client_module.Client._handle_data_frame = _patched_handle_data_frame
+    # --- End patch ---
+
     try:
         ws_client.start()
     except Exception:
@@ -1001,6 +1058,7 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
             setattr(ws_client, "_configure", original_configure)
+        ws_client_module.Client._handle_data_frame = _original_handle_data_frame
         pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
         for task in pending:
             task.cancel()
@@ -1425,6 +1483,58 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def _create_db_approval(self, command: str, description: str) -> Optional[str]:
+        """POST to management-api to persist a pending exec-approval record. Returns DB id or None."""
+        if aiohttp is None:
+            return None
+        api_url = os.getenv("OPC_MANAGEMENT_API_URL", "")
+        employee_id = os.getenv("HERMES_EMPLOYEE_ID", "")
+        if not api_url or not employee_id:
+            return None
+        try:
+            payload = {
+                "employee_id": employee_id,
+                "tool_name": "terminal",
+                "tool_args": {"command": command[:500]},
+                "reason": description,
+            }
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    f"{api_url}/api/approvals",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status == 201:
+                        data = await resp.json()
+                        return data.get("id")
+                    logger.debug("[Feishu] DB approval create returned %s", resp.status)
+        except Exception as exc:
+            logger.debug("[Feishu] Failed to create DB approval: %s", exc)
+        return None
+
+    async def _resolve_db_approval(self, db_approval_id: str, choice: str, user_name: str) -> None:
+        """Update the management-api DB approval record with the user's decision."""
+        if aiohttp is None:
+            return
+        api_url = os.getenv("OPC_MANAGEMENT_API_URL", "")
+        if not api_url:
+            return
+        try:
+            endpoint = "reject" if choice == "deny" else "approve"
+            payload: dict = {"decided_by": user_name}
+            if choice == "deny":
+                payload["reject_reason"] = "Denied via Feishu card"
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    f"{api_url}/api/approvals/{db_approval_id}/{endpoint}",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.debug("[Feishu] DB approval resolve %s returned %s", db_approval_id, resp.status)
+        except Exception as exc:
+            logger.debug("[Feishu] Failed to resolve DB approval %s: %s", db_approval_id, exc)
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -1490,6 +1600,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
                 }
+                db_id = await self._create_db_approval(command, description)
+                if db_id:
+                    self._approval_state[approval_id]["db_approval_id"] = db_id
             return result
         except Exception as exc:
             logger.warning("[Feishu] send_exec_approval failed: %s", exc)
@@ -1961,7 +2074,21 @@ class FeishuAdapter(BasePlatformAdapter):
             approval_id = action_value.get("approval_id")
             state = self._approval_state.pop(approval_id, None)
             if not state:
-                logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
+                logger.warning("[Feishu] Approval %s not found (card may be stale after restart)", approval_id)
+                # Notify the user so they know to re-trigger
+                if self._client and chat_id:
+                    try:
+                        stale_msg = (
+                            "⚠️ 此审批卡片已失效（服务重启后审批状态已清空）。"
+                            "请重新发送消息，等待新的审批卡片出现后再操作。"
+                        )
+                        await self._feishu_send_with_retry(
+                            chat_id=chat_id, msg_type="text",
+                            payload=json.dumps({"text": stale_msg}, ensure_ascii=False),
+                            reply_to=None,
+                        )
+                    except Exception:
+                        pass
                 return
 
             choice_map = {
@@ -1996,39 +2123,21 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
 
+            # Persist decision to management-api DB (fire-and-forget, non-blocking)
+            db_id = state.get("db_approval_id")
+            if db_id:
+                await self._resolve_db_approval(db_id, choice, user_name)
+
             # Update the card to show the decision
             await self._update_approval_card(state.get("message_id", ""), label, user_name, choice)
             return
 
-        synthetic_text = f"/card {action_tag}"
-        if action_value:
-            try:
-                synthetic_text += f" {json.dumps(action_value, ensure_ascii=False)}"
-            except Exception:
-                pass
-
-        sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-        sender_profile = await self._resolve_sender_profile(sender_id)
-        chat_info = await self.get_chat_info(chat_id)
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
-            user_id=sender_profile["user_id"],
-            user_name=sender_profile["user_name"],
-            thread_id=None,
-            user_id_alt=sender_profile["user_id_alt"],
+        # Non-hermes card button: drop silently.
+        # Routing unknown card buttons as /card commands causes "Unrecognized slash command" noise.
+        logger.debug(
+            "[Feishu] Ignoring non-hermes card action tag=%r value=%r from %s in %s",
+            action_tag, action_value, open_id, chat_id,
         )
-        synthetic_event = MessageEvent(
-            text=synthetic_text,
-            message_type=MessageType.COMMAND,
-            source=source,
-            raw_message=data,
-            message_id=token or str(uuid.uuid4()),
-            timestamp=datetime.now(),
-        )
-        logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
-        await self._handle_message_with_guards(synthetic_event)
 
     # =========================================================================
     # Per-chat serialization and typing indicator
